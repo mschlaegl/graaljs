@@ -3467,9 +3467,6 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
     public abstract static class JSArrayToReversedNode extends JSArrayOperation {
         @Child private TestArrayNode hasHolesNode;
         @Child private DeletePropertyNode deletePropertyNode;
-        private final ConditionProfile bothExistProfile = ConditionProfile.createBinaryProfile();
-        private final ConditionProfile onlyUpperExistsProfile = ConditionProfile.createBinaryProfile();
-        private final ConditionProfile onlyLowerExistsProfile = ConditionProfile.createBinaryProfile();
 
         public JSArrayToReversedNode(JSContext context, JSBuiltin builtin) {
             super(context, builtin);
@@ -3486,74 +3483,34 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
 
         @Specialization
         protected Object toReversedJSArray(JSArrayObject thisObj) {
-            return reverse(thisObj, true);
+            return toReversed(thisObj, true);
         }
 
         @Specialization(replaces = "toReversedJSArray")
         protected Object reverseGeneric(Object thisObj) {
             final Object array = toObject(thisObj);
-            return reverse(array, JSArray.isJSArray(array));
+            return toReversed(array, JSArray.isJSArray(array));
         }
 
-        private Object reverse(Object array, boolean isArray) {
+        private Object toReversed(Object array, boolean isArray) {
+            long srcIdx = 0;
             final long length = getLength(array);
-            long lower = 0;
-            long upper = length - 1;
-            boolean hasHoles = isArray && hasHolesNode.executeBoolean((JSDynamicObject) array);
+            Object resultArray = getArraySpeciesConstructorNode().arraySpeciesCreate(array, length);
 
-            while (lower < upper) {
-                boolean lowerExists;
-                boolean upperExists;
-                Object lowerValue = null;
-                Object upperValue = null;
+            // TODO Schlaegl: holes?
+            for (srcIdx = 0; srcIdx < length; srcIdx++) {
+                long tgtIdx = length - srcIdx - 1;
+                Object val = read(array, srcIdx);
 
-                if (getContext().getEcmaScriptVersion() < 6) { // ES5 expects GET before HAS
-                    lowerValue = read(array, lower);
-                    upperValue = read(array, upper);
-                    lowerExists = lowerValue != Undefined.instance || hasProperty(array, lower);
-                    upperExists = upperValue != Undefined.instance || hasProperty(array, upper);
-                } else { // ES6 expects HAS before GET and tries GET only if HAS succeeds
-                    lowerExists = hasProperty(array, lower);
-                    if (lowerExists) {
-                        lowerValue = read(array, lower);
-                    }
-                    upperExists = hasProperty(array, upper);
-                    if (upperExists) {
-                        upperValue = read(array, upper);
-                    }
-                }
-
-                if (bothExistProfile.profile(lowerExists && upperExists)) {
-                    write(array, lower, upperValue);
-                    write(array, upper, lowerValue);
-                } else if (onlyUpperExistsProfile.profile(!lowerExists && upperExists)) {
-                    write(array, lower, upperValue);
-                    deleteProperty(array, upper);
-                } else if (onlyLowerExistsProfile.profile(lowerExists && !upperExists)) {
-                    deleteProperty(array, lower);
-                    write(array, upper, lowerValue);
-                } else {
-                    assert !lowerExists && !upperExists; // No action required.
-                }
-
-                if (hasHoles) {
-                    long nextLower = nextElementIndex(array, lower, length);
-                    long nextUpper = previousElementIndex(array, upper);
-                    if ((length - nextLower - 1) >= nextUpper) {
-                        lower = nextLower;
-                        upper = length - lower - 1;
-                    } else {
-                        lower = length - nextUpper - 1;
-                        upper = nextUpper;
-                    }
-                } else {
-                    lower++;
-                    upper--;
-                }
+                // TODO Schlaegl: necessary?
+                if (val != Undefined.instance || hasProperty(array, srcIdx))
+                    write(resultArray, tgtIdx, val);
+                else
+                    deleteProperty(resultArray, tgtIdx);
                 TruffleSafepoint.poll(this);
             }
-            reportLoopCount(lower);
-            return array;
+            reportLoopCount(srcIdx);
+            return resultArray;
         }
     }
 }
