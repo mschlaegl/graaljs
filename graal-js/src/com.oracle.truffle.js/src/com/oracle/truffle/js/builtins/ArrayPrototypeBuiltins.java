@@ -3783,7 +3783,6 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
         @Child private DeletePropertyNode deletePropertyNode; // DeletePropertyOrThrow
         private final BranchProfile branchA = BranchProfile.create();
         private final BranchProfile branchB = BranchProfile.create();
-        private final BranchProfile branchDelete = BranchProfile.create();
         private final BranchProfile objectBranch = BranchProfile.create();
         private final ConditionProfile argsLength0Profile = ConditionProfile.createBinaryProfile();
         private final ConditionProfile argsLength1Profile = ConditionProfile.createBinaryProfile();
@@ -3824,37 +3823,51 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
                 throwLengthError();
             }
 
-            JSDynamicObject aObj = (JSDynamicObject) getArraySpeciesConstructorNode().createEmptyContainer(thisObj, actualDeleteCount);
-
-            if (actualDeleteCount > 0) {
-                // copy deleted elements into result array
-                branchDelete.enter();
-                spliceRead(thisObj, actualStart, actualDeleteCount, aObj, len);
-            }
-            setLength(aObj, actualDeleteCount);
+            Object resObj = cloneArray(thisObj);
 
             long itemCount = insertCount;
             boolean isJSArray = JSArray.isJSArray(thisObj);
             if (isJSArray) {
-                JSArrayObject dynObj = (JSArrayObject) thisObj;
-                ScriptArray arrayType = arrayGetArrayType(dynObj);
-                spliceJSArray.execute(dynObj, len, actualStart, actualDeleteCount, itemCount, arrayType, this);
+                JSArrayObject resDynObj = (JSArrayObject) resObj;
+                ScriptArray arrayType = arrayGetArrayType(resDynObj);
+                spliceJSArray.execute(resDynObj, len, actualStart, actualDeleteCount, itemCount, arrayType, this);
             } else if (JSDynamicObject.isJSDynamicObject(thisObj)) {
+                // TODO Schlaegl ????
                 objectBranch.enter();
-                spliceJSObject(thisObj, len, actualStart, actualDeleteCount, itemCount);
+                spliceJSObject(resObj, len, actualStart, actualDeleteCount, itemCount);
             } else {
-                spliceForeignArray(thisObj, len, actualStart, actualDeleteCount, itemCount);
+                // TODO Schlaegl ????
+                spliceForeignArray(resObj, len, actualStart, actualDeleteCount, itemCount);
             }
 
             if (itemCount > 0) {
                 needInsertBranch.enter();
-                spliceInsert(thisObj, actualStart, args);
+                spliceInsert(resObj, actualStart, args);
             }
 
             long newLength = len - actualDeleteCount + itemCount;
-            setLength(thisObj, newLength);
+            setLength(resObj, newLength);
             reportLoopCount(len);
-            return aObj;
+            return (JSArrayObject) resObj;
+        }
+
+        private Object cloneArray(Object array) {
+            long srcIdx = 0;
+            final long length = getLength(array);
+            Object resultArray = getArraySpeciesConstructorNode().arraySpeciesCreate(array, length);
+
+            // TODO Schlaegl: holes?
+            for (srcIdx = 0; srcIdx < length; srcIdx++) {
+                long tgtIdx = srcIdx;
+                Object val = read(array, srcIdx);
+
+                // TODO Schlaegl: necessary
+                // if (val != Undefined.instance || hasProperty(array, srcIdx))
+                write(resultArray, tgtIdx, val);
+                TruffleSafepoint.poll(this);
+            }
+            reportLoopCount(srcIdx);
+            return resultArray;
         }
 
         abstract static class spliceJSArrayNode extends JavaScriptBaseNode {
