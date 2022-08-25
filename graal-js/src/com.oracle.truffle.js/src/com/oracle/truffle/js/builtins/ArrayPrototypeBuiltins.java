@@ -113,6 +113,7 @@ import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArraySplic
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToLocaleStringNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToReversedNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToSortedNodeGen;
+import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToSplicedNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToStringNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayUnshiftNodeGen;
 import com.oracle.truffle.js.builtins.helper.JSCollectionsNormalizeNode;
@@ -263,7 +264,8 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
 
         // https://github.com/tc39/proposal-change-array-by-copy
         toReversed(0),
-        toSorted(1);
+        toSorted(1),
+        toSpliced(2);
 
         private final int length;
 
@@ -377,6 +379,8 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
                 return JSArrayToReversedNodeGen.create(context, builtin, args().withThis().createArgumentNodes(context));
             case toSorted:
                 return JSArrayToSortedNodeGen.create(context, builtin, false, args().withThis().fixedArgs(1).createArgumentNodes(context));
+            case toSpliced:
+                return JSArrayToSplicedNodeGen.create(context, builtin, args().withThis().varArgs().createArgumentNodes(context));
         }
         return null;
     }
@@ -3771,6 +3775,279 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
                 array[index] = JSInteropUtil.readArrayElementOrDefault(thisObj, index, Undefined.instance, interop, importValue, this);
             }
             return array;
+        }
+    }
+
+    public abstract static class JSArrayToSplicedNode extends JSArrayOperationWithToInt {
+
+        @Child private DeletePropertyNode deletePropertyNode; // DeletePropertyOrThrow
+        private final BranchProfile branchA = BranchProfile.create();
+        private final BranchProfile branchB = BranchProfile.create();
+        private final BranchProfile branchDelete = BranchProfile.create();
+        private final BranchProfile objectBranch = BranchProfile.create();
+        private final ConditionProfile argsLength0Profile = ConditionProfile.createBinaryProfile();
+        private final ConditionProfile argsLength1Profile = ConditionProfile.createBinaryProfile();
+        private final ConditionProfile offsetProfile = ConditionProfile.createBinaryProfile();
+        private final BranchProfile needMoveDeleteBranch = BranchProfile.create();
+        private final BranchProfile needInsertBranch = BranchProfile.create();
+        @Child private InteropLibrary arrayInterop;
+
+        public JSArrayToSplicedNode(JSContext context, JSBuiltin builtin) {
+            super(context, builtin);
+            this.deletePropertyNode = DeletePropertyNode.create(THROW_ERROR, context);
+        }
+
+        @Specialization
+        protected JSDynamicObject toSpliced(Object thisArg, Object[] args,
+                        @Cached("create(getContext())") spliceJSArrayNode spliceJSArray) {
+            Object thisObj = toObject(thisArg);
+            long len = getLength(thisObj);
+
+            long actualStart = JSRuntime.getOffset(toIntegerAsLong(JSRuntime.getArgOrUndefined(args, 0)), len, offsetProfile);
+            long insertCount;
+            long actualDeleteCount;
+            if (argsLength0Profile.profile(args.length == 0)) {
+                insertCount = 0;
+                actualDeleteCount = 0;
+            } else if (argsLength1Profile.profile(args.length == 1)) {
+                insertCount = 0;
+                actualDeleteCount = len - actualStart;
+            } else {
+                assert args.length >= 2;
+                insertCount = args.length - 2;
+                long deleteCount = toIntegerAsLong(JSRuntime.getArgOrUndefined(args, 1));
+                actualDeleteCount = Math.min(Math.max(deleteCount, 0), len - actualStart);
+            }
+
+            if (len + insertCount - actualDeleteCount > JSRuntime.MAX_SAFE_INTEGER_LONG) {
+                errorBranch.enter();
+                throwLengthError();
+            }
+
+            JSDynamicObject aObj = (JSDynamicObject) getArraySpeciesConstructorNode().createEmptyContainer(thisObj, actualDeleteCount);
+
+            if (actualDeleteCount > 0) {
+                // copy deleted elements into result array
+                branchDelete.enter();
+                spliceRead(thisObj, actualStart, actualDeleteCount, aObj, len);
+            }
+            setLength(aObj, actualDeleteCount);
+
+            long itemCount = insertCount;
+            boolean isJSArray = JSArray.isJSArray(thisObj);
+            if (isJSArray) {
+                JSArrayObject dynObj = (JSArrayObject) thisObj;
+                ScriptArray arrayType = arrayGetArrayType(dynObj);
+                spliceJSArray.execute(dynObj, len, actualStart, actualDeleteCount, itemCount, arrayType, this);
+            } else if (JSDynamicObject.isJSDynamicObject(thisObj)) {
+                objectBranch.enter();
+                spliceJSObject(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            } else {
+                spliceForeignArray(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            }
+
+            if (itemCount > 0) {
+                needInsertBranch.enter();
+                spliceInsert(thisObj, actualStart, args);
+            }
+
+            long newLength = len - actualDeleteCount + itemCount;
+            setLength(thisObj, newLength);
+            reportLoopCount(len);
+            return aObj;
+        }
+
+        abstract static class spliceJSArrayNode extends JavaScriptBaseNode {
+            final JSContext context;
+
+            spliceJSArrayNode(JSContext context) {
+                this.context = context;
+            }
+
+            abstract void execute(JSDynamicObject array, long len, long actualStart, long actualDeleteCount, long itemCount, ScriptArray arrayType, JSArrayToSplicedNode parent);
+
+            @Specialization(guards = {"cachedArrayType.isInstance(arrayType)"}, limit = "5")
+            static void doCached(JSDynamicObject array, long len, long actualStart, long actualDeleteCount, long itemCount, ScriptArray arrayType, JSArrayToSplicedNode parent,
+                            @Cached("arrayType") ScriptArray cachedArrayType,
+                            @Cached GetPrototypeNode getPrototypeNode,
+                            @Cached ConditionProfile arrayElementwise) {
+                if (arrayElementwise.profile(parent.mustUseElementwise(array, len, cachedArrayType.cast(arrayType), getPrototypeNode))) {
+                    parent.spliceJSArrayElementwise(array, len, actualStart, actualDeleteCount, itemCount);
+                } else {
+                    parent.spliceJSArrayBlockwise(array, actualStart, actualDeleteCount, itemCount, cachedArrayType.cast(arrayType));
+                }
+            }
+
+            @Specialization(replaces = "doCached")
+            static void doUncached(JSDynamicObject array, long len, long actualStart, long actualDeleteCount, long itemCount, ScriptArray arrayType, JSArrayToSplicedNode parent,
+                            @Cached GetPrototypeNode getPrototypeNode,
+                            @Cached ConditionProfile arrayElementwise) {
+                if (arrayElementwise.profile(parent.mustUseElementwise(array, len, arrayType, getPrototypeNode))) {
+                    parent.spliceJSArrayElementwise(array, len, actualStart, actualDeleteCount, itemCount);
+                } else {
+                    parent.spliceJSArrayBlockwise(array, actualStart, actualDeleteCount, itemCount, arrayType);
+                }
+            }
+        }
+
+        final boolean mustUseElementwise(JSDynamicObject obj, long expectedLength, ScriptArray array, GetPrototypeNode getPrototypeNode) {
+            return array instanceof SparseArray ||
+                            array.isLengthNotWritable() ||
+                            getPrototypeNode.execute(obj) != getRealm().getArrayPrototype() ||
+                            !getContext().getArrayPrototypeNoElementsAssumption().isValid() ||
+                            (!getContext().getFastArrayAssumption().isValid() && JSSlowArray.isJSSlowArray(obj)) ||
+                            array.length(obj) != expectedLength;
+        }
+
+        private void spliceRead(Object thisObj, long actualStart, long actualDeleteCount, JSDynamicObject aObj, long length) {
+            long kPlusStart = actualStart;
+            if (!hasProperty(thisObj, kPlusStart)) {
+                kPlusStart = nextElementIndex(thisObj, kPlusStart, length);
+            }
+            while (kPlusStart < (actualDeleteCount + actualStart)) {
+                Object fromValue = read(thisObj, kPlusStart);
+                writeOwn(aObj, kPlusStart - actualStart, fromValue);
+                kPlusStart = nextElementIndex(thisObj, kPlusStart, length);
+            }
+        }
+
+        private void spliceInsert(Object thisObj, long actualStart, Object[] args) {
+            final int itemOffset = 2;
+            for (int i = itemOffset; i < args.length; i++) {
+                write(thisObj, actualStart + i - itemOffset, args[i]);
+            }
+        }
+
+        private void spliceJSObject(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            if (itemCount < actualDeleteCount) {
+                branchA.enter();
+                spliceJSObjectShrink(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            } else if (itemCount > actualDeleteCount) {
+                branchB.enter();
+                spliceJSObjectMove(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            }
+        }
+
+        private void spliceJSObjectMove(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            for (long k = len - actualDeleteCount; k > actualStart; k--) {
+                spliceMoveValue(thisObj, (k + actualDeleteCount - 1), (k + itemCount - 1));
+            }
+        }
+
+        private void spliceJSObjectShrink(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            for (long k = actualStart; k < len - actualDeleteCount; k++) {
+                spliceMoveValue(thisObj, (k + actualDeleteCount), (k + itemCount));
+            }
+            for (long k = len; k > len - actualDeleteCount + itemCount; k--) {
+                deletePropertyNode.executeEvaluated(thisObj, k - 1);
+            }
+        }
+
+        private void spliceMoveValue(Object thisObj, long fromIndex, long toIndex) {
+            if (hasProperty(thisObj, fromIndex)) {
+                Object val = read(thisObj, fromIndex);
+                write(thisObj, toIndex, val);
+            } else {
+                needMoveDeleteBranch.enter();
+                deletePropertyNode.executeEvaluated(thisObj, toIndex);
+            }
+        }
+
+        final void spliceJSArrayElementwise(JSDynamicObject thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            assert JSArray.isJSArray(thisObj); // contract
+            if (itemCount < actualDeleteCount) {
+                branchA.enter();
+                spliceJSArrayElementwiseWalkUp(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            } else if (itemCount > actualDeleteCount) {
+                branchB.enter();
+                spliceJSArrayElementwiseWalkDown(thisObj, len, actualStart, actualDeleteCount, itemCount);
+            }
+        }
+
+        private void spliceJSArrayElementwiseWalkDown(JSDynamicObject thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            long k = len - 1;
+            long delta = itemCount - actualDeleteCount;
+            while (k > (actualStart + actualDeleteCount - 1)) {
+                spliceMoveValue(thisObj, k, k + delta);
+                if ((k - delta) > (actualStart + actualDeleteCount - 1) && !hasProperty(thisObj, k - delta)) {
+                    // previousElementIndex lets us not visit all elements, thus this delete
+                    deletePropertyNode.executeEvaluated(thisObj, k);
+                }
+                k = previousElementIndex(thisObj, k);
+            }
+        }
+
+        private void spliceJSArrayElementwiseWalkUp(JSDynamicObject thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            long k = actualStart + actualDeleteCount;
+            long delta = itemCount - actualDeleteCount;
+            while (k < len) {
+                spliceMoveValue(thisObj, k, k + delta);
+
+                if ((k - delta) < len && !hasProperty(thisObj, k - delta)) {
+                    // nextElementIndex lets us not visit all elements, thus this delete
+                    deletePropertyNode.executeEvaluated(thisObj, k);
+                }
+                k = nextElementIndex(thisObj, k, len);
+            }
+
+            k = len - 1;
+            while (k >= len + delta) {
+                deletePropertyNode.executeEvaluated(thisObj, k);
+                k = previousElementIndex(thisObj, k);
+            }
+        }
+
+        final void spliceJSArrayBlockwise(JSDynamicObject thisObj, long actualStart, long actualDeleteCount, long itemCount, ScriptArray array) {
+            assert JSArray.isJSArray(thisObj); // contract
+            if (itemCount < actualDeleteCount) {
+                branchA.enter();
+                arraySetArrayType(thisObj, array.removeRange(thisObj, actualStart + itemCount, actualStart + actualDeleteCount, errorBranch));
+            } else if (itemCount > actualDeleteCount) {
+                branchB.enter();
+                arraySetArrayType(thisObj, array.addRange(thisObj, actualStart, (int) (itemCount - actualDeleteCount)));
+            }
+        }
+
+        private void spliceForeignArray(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount) {
+            InteropLibrary arrays = arrayInterop;
+            if (arrays == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                this.arrayInterop = arrays = insert(InteropLibrary.getFactory().createDispatched(JSConfig.InteropLibraryLimit));
+            }
+            try {
+                if (itemCount < actualDeleteCount) {
+                    branchA.enter();
+                    spliceForeignArrayShrink(thisObj, len, actualStart, actualDeleteCount, itemCount, arrays);
+                } else if (itemCount > actualDeleteCount) {
+                    branchB.enter();
+                    spliceForeignArrayMove(thisObj, len, actualStart, actualDeleteCount, itemCount, arrays);
+                }
+            } catch (UnsupportedMessageException | InvalidArrayIndexException | UnsupportedTypeException e) {
+                throw Errors.createTypeErrorInteropException(thisObj, e, "splice", this);
+            }
+        }
+
+        private static void spliceForeignArrayMove(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount, InteropLibrary arrays)
+                        throws UnsupportedMessageException, InvalidArrayIndexException, UnsupportedTypeException {
+            for (long k = len - actualDeleteCount; k > actualStart; k--) {
+                spliceForeignMoveValue(thisObj, (k + actualDeleteCount - 1), (k + itemCount - 1), arrays);
+            }
+        }
+
+        private static void spliceForeignArrayShrink(Object thisObj, long len, long actualStart, long actualDeleteCount, long itemCount, InteropLibrary arrays)
+                        throws UnsupportedMessageException, InvalidArrayIndexException, UnsupportedTypeException {
+            for (long k = actualStart; k < len - actualDeleteCount; k++) {
+                spliceForeignMoveValue(thisObj, (k + actualDeleteCount), (k + itemCount), arrays);
+            }
+            for (long k = len; k > len - actualDeleteCount + itemCount; k--) {
+                arrays.removeArrayElement(thisObj, k - 1);
+            }
+        }
+
+        private static void spliceForeignMoveValue(Object thisObj, long fromIndex, long toIndex, InteropLibrary arrays)
+                        throws UnsupportedMessageException, InvalidArrayIndexException, UnsupportedTypeException {
+            Object val = arrays.readArrayElement(thisObj, fromIndex);
+            arrays.writeArrayElement(thisObj, toIndex, val);
         }
     }
 }
