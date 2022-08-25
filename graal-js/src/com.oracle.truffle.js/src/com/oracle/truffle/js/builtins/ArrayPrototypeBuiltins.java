@@ -116,6 +116,7 @@ import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToSor
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToSplicedNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayToStringNodeGen;
 import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayUnshiftNodeGen;
+import com.oracle.truffle.js.builtins.ArrayPrototypeBuiltinsFactory.JSArrayWithNodeGen;
 import com.oracle.truffle.js.builtins.helper.JSCollectionsNormalizeNode;
 import com.oracle.truffle.js.nodes.JSGuards;
 import com.oracle.truffle.js.nodes.JSNodeUtil;
@@ -265,7 +266,8 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
         // https://github.com/tc39/proposal-change-array-by-copy
         toReversed(0),
         toSorted(1),
-        toSpliced(2);
+        toSpliced(2),
+        with(2);
 
         private final int length;
 
@@ -381,6 +383,8 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
                 return JSArrayToSortedNodeGen.create(context, builtin, false, args().withThis().fixedArgs(1).createArgumentNodes(context));
             case toSpliced:
                 return JSArrayToSplicedNodeGen.create(context, builtin, args().withThis().varArgs().createArgumentNodes(context));
+            case with:
+                return JSArrayWithNodeGen.create(context, builtin, args().withThis().fixedArgs(2).createArgumentNodes(context));
         }
         return null;
     }
@@ -4061,6 +4065,62 @@ public final class ArrayPrototypeBuiltins extends JSBuiltinsContainer.SwitchEnum
                         throws UnsupportedMessageException, InvalidArrayIndexException, UnsupportedTypeException {
             Object val = arrays.readArrayElement(thisObj, fromIndex);
             arrays.writeArrayElement(thisObj, toIndex, val);
+        }
+    }
+
+    public abstract static class JSArrayWithNode extends JSArrayOperationWithToInt {
+        @Child private TestArrayNode hasHolesNode;
+        @Child private DeletePropertyNode deletePropertyNode;
+        private final ConditionProfile offsetProfile = ConditionProfile.createBinaryProfile();
+
+        public JSArrayWithNode(JSContext context, JSBuiltin builtin) {
+            super(context, builtin);
+            this.hasHolesNode = TestArrayNode.createHasHoles();
+        }
+
+        private boolean deleteProperty(Object array, long index) {
+            if (deletePropertyNode == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                deletePropertyNode = insert(DeletePropertyNode.create(true, getContext()));
+            }
+            return deletePropertyNode.executeEvaluated(array, index);
+        }
+
+        @Specialization
+        protected Object withJSArray(JSArrayObject thisObj, final Object newValIdxObj, final Object newValObj) {
+            return with(thisObj, newValIdxObj, newValObj);
+        }
+
+        @Specialization(replaces = "withJSArray")
+        protected Object withGeneric(Object thisObj, final Object newValIdxObj, final Object newValObj) {
+            final Object array = toObject(thisObj);
+            return with(array, newValIdxObj, newValObj);
+        }
+
+        private Object with(Object array, final Object newValIdxObj, final Object newValObj) {
+            final long len = getLength(array);
+            final long newValIdx = JSRuntime.getOffset(toIntegerAsLong(newValIdxObj), len, offsetProfile);
+            long srcIdx = 0;
+            final long length = getLength(array);
+            Object resultArray = getArraySpeciesConstructorNode().arraySpeciesCreate(array, length);
+
+            // TODO Schlaegl: holes?
+            for (srcIdx = 0; srcIdx < length; srcIdx++) {
+                long tgtIdx = srcIdx;
+                Object val = read(array, srcIdx);
+
+                if (tgtIdx == newValIdx)
+                    val = newValObj;
+
+                // TODO Schlaegl: necessary
+                if (val != Undefined.instance || hasProperty(array, srcIdx))
+                    write(resultArray, tgtIdx, val);
+                else
+                    deleteProperty(resultArray, tgtIdx);
+                TruffleSafepoint.poll(this);
+            }
+            reportLoopCount(srcIdx);
+            return resultArray;
         }
     }
 }
